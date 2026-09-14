@@ -1,4 +1,5 @@
 **Comparative Evaluation of Movie Recommendation Methods**
+
 Under Varying Data Availability
 
 Senior Seminar I research project investigating the performance
