@@ -23,12 +23,30 @@ def ndcg_at_k(recommended_movie_ids, relevant_movie_ids, k=10):
 
     return dcg / idcg
 
+def make_reduced_training_set(train_ratings, availability, seed):
+        if availability == 1.00:
+            return train_ratings.copy()
+
+        reduced_parts = []
+
+        for user_id, user_ratings in train_ratings.groupby("userId"):
+            sampled_ratings = user_ratings.sample(
+                frac=availability,
+                random_state=seed
+            )
+            reduced_parts.append(sampled_ratings)
+
+        return pd.concat(reduced_parts, ignore_index=True)
+
 def evaluate_collaborative(
     reduced_train_ratings,
     test_ratings,
-    min_training_ratings=5,
+    fixed_user_ids,
+    fixed_movie_ids,
+    original_train_ratings,
     k=10
 ):
+
     # Build the user-movie matrix from this training condition
     user_movie_matrix = reduced_train_ratings.pivot_table(
         index="userId",
@@ -46,13 +64,12 @@ def evaluate_collaborative(
     user_factors = svd.fit_transform(user_movie_matrix)
     predicted_ratings = svd.inverse_transform(user_factors)
         # Find movies available in this training condition
-    training_movie_ids = set(
-        reduced_train_ratings["movieId"]
-    )
+   # Use the same movie catalog across all experiments
+    training_movie_ids = set(fixed_movie_ids)
 
-    # Keep test ratings only for movies seen during training
+    # Keep only test ratings from the fixed movie catalog
     eligible_test_ratings = test_ratings[
-        test_ratings["movieId"].isin(training_movie_ids)
+        test_ratings["movieId"].isin(fixed_movie_ids)
     ]
 
     # Relevant items are movies rated 4 or higher
@@ -60,27 +77,10 @@ def evaluate_collaborative(
         eligible_test_ratings["rating"] >= 4.0
     ]
 
-    # Users need at least the minimum number of training ratings
-    ratings_per_user = reduced_train_ratings.groupby(
-        "userId"
-    ).size()
+    # Use the same evaluation users across all experiments
+    eligible_users = set(fixed_user_ids)
 
-    training_eligible_users = set(
-        ratings_per_user[
-            ratings_per_user >= min_training_ratings
-        ].index
-    )
-
-    # Users also need at least one relevant test item
-    relevant_test_users = set(
-        relevant_test_ratings["userId"].unique()
-    )
-
-    eligible_users = (
-        training_eligible_users &
-        relevant_test_users
-    )
-        # Calculate NDCG@K for each eligible user
+    # Calculate NDCG@K for each eligible user
     ndcg_scores = []
 
     for user_id in sorted(eligible_users):
@@ -92,18 +92,24 @@ def evaluate_collaborative(
         user_scores = predicted_ratings[user_index]
 
         # Get movies already seen in this training condition
+        # Exclude all movies rated in the original training set
         seen_movies = set(
-            reduced_train_ratings.loc[
-                reduced_train_ratings["userId"] == user_id,
-                "movieId"
-            ]
-        )
+            original_train_ratings.loc[
+            original_train_ratings["userId"] == user_id,
+            "movieId"
+        ]
+    )
 
-        # Create recommendation candidates
+        # Create recommendation candidates from the fixed movie catalog
         recommendations = pd.DataFrame({
             "movieId": user_movie_matrix.columns,
             "predicted_score": user_scores
         })
+
+        # Keep only movies available in every experiment
+        recommendations = recommendations[
+            recommendations["movieId"].isin(fixed_movie_ids)
+        ]
 
         # Remove movies already seen during training
         recommendations = recommendations[
@@ -179,6 +185,67 @@ print("Test users:", test_ratings["userId"].nunique())
 # Test each training-data availability level
 availability_levels = [0.20, 0.40, 0.60, 0.80, 1.00]
 subsample_seeds = [42, 43, 44, 45, 46]
+
+# Generate and store all training conditions
+training_conditions = {}
+
+for availability in availability_levels:
+    seeds = subsample_seeds if availability < 1.00 else [42]
+
+    for seed in seeds:
+        training_conditions[(availability, seed)] = make_reduced_training_set(
+            train_ratings,
+            availability,
+            seed
+        )
+
+print("\nTraining conditions prepared:", len(training_conditions))
+
+# Find movies available in every training condition
+common_movie_ids = set(train_ratings["movieId"].unique())
+
+for condition_ratings in training_conditions.values():
+    common_movie_ids &= set(condition_ratings["movieId"].unique())
+
+print("Movies available in all conditions:", len(common_movie_ids))
+
+# Identify users eligible in every training condition
+common_user_ids = set(train_ratings["userId"].unique())
+
+for condition_ratings in training_conditions.values():
+    ratings_per_user = condition_ratings.groupby("userId").size()
+
+    eligible_user_ids = set(
+        ratings_per_user[ratings_per_user >= 5].index
+    )
+
+    common_user_ids &= eligible_user_ids
+
+# Keep fixed test ratings for movies available in all conditions
+common_test_ratings = test_ratings[
+    test_ratings["movieId"].isin(common_movie_ids)
+].copy()
+
+# Identify users with at least one relevant common test movie
+users_with_relevant_test_movies = set(
+    common_test_ratings.loc[
+        common_test_ratings["rating"] >= 4.0,
+        "userId"
+    ]
+)
+
+common_user_ids &= users_with_relevant_test_movies
+
+print("Users eligible in all conditions:", len(common_user_ids))
+print("Common test ratings:", len(common_test_ratings))
+
+# Keep only test ratings belonging to our fixed evaluation users
+common_test_ratings = common_test_ratings[
+    common_test_ratings["userId"].isin(common_user_ids)
+].copy()
+
+print("Fixed evaluation users:", len(common_user_ids))
+print("Fixed evaluation test ratings:", len(common_test_ratings))
 
 for availability in availability_levels:
     # Reduced-data conditions use five seeds.
@@ -497,9 +564,13 @@ for availability in availability_levels:
         )
 
         # Evaluate this condition
+        # Evaluate using the same users and movies in every condition
         result = evaluate_collaborative(
             current_train_ratings,
-            test_ratings
+            common_test_ratings,
+            common_user_ids,
+            common_movie_ids,
+            train_ratings
         )
 
         # Save the result
@@ -518,7 +589,7 @@ collaborative_results_df = pd.DataFrame(collaborative_results)
 
 # Save results to CSV
 collaborative_results_df.to_csv(
-    "results/collaborative_experiment_results.csv",
+    "results/collaborative_midterm_results.csv",
     index=False
 )
 
@@ -527,7 +598,7 @@ print(collaborative_results_df)
 
 print(
     "\nResults saved to "
-    "results/collaborative_experiment_results.csv"
+    "results/collaborative_midterm_results.csv"
 )
 
 # Summarize mean performance at each availability level
